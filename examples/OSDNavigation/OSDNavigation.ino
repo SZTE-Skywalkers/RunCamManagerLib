@@ -10,8 +10,8 @@
  *   ESP32-S3 GPIO17 (TX2) ──→ RunCam RX
  *   GND ──────────────────── GND (shared ground required)
  *
- * The example opens the OSD menu, navigates down twice, and confirms
- * the selection – then exits the menu after a short pause.
+ * The example opens the OSD connection, navigates down twice, confirms
+ * the selection, then closes the connection.
  *
  * NOTE: The camera must advertise RunCamFeature::Simulate5KeyOSD to
  *       support these commands.
@@ -48,13 +48,21 @@ void setup()
     Serial.println("Camera ready. Starting OSD navigation sequence...");
     delay(1000);
 
+    // Open the OSD cable connection (required before sending key events).
+    Serial.println("Opening OSD connection...");
+    if (!camera.openOSDConnection()) {
+        Serial.println("Failed to open OSD connection.");
+        return;
+    }
+    delay(200);
+
     // Open the OSD menu by pressing the center/enter key.
     Serial.println("Open menu (Center key)");
     camera.confirmOSD();
     delay(500);
 
     // Navigate down two items.
-    Serial.println("Navigate Down (×2)");
+    Serial.println("Navigate Down (x2)");
     camera.navigateDown();
     delay(300);
     camera.navigateDown();
@@ -76,13 +84,17 @@ void setup()
     delay(500);
 
     // Exit the menu by pressing left / back enough times.
-    Serial.println("Exit menu (Left key ×3)");
+    Serial.println("Exit menu (Left key x3)");
     camera.navigateLeft();
     delay(300);
     camera.navigateLeft();
     delay(300);
     camera.navigateLeft();
     delay(300);
+
+    // Close the OSD connection when done.
+    Serial.println("Closing OSD connection...");
+    camera.closeOSDConnection();
 
     Serial.println("OSD navigation sequence complete.");
 }

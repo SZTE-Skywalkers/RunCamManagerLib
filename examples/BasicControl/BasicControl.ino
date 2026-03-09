@@ -40,7 +40,6 @@ void setup()
 
         const RunCamDeviceInfo& info = camera.getDeviceInfo();
         Serial.printf("  Protocol version : %u\n",  info.protocolVersion);
-        Serial.printf("  Camera type      : 0x%02X\n", info.cameraType);
         Serial.printf("  Feature flags    : 0x%04X\n", info.features);
 
         // Print which features the camera advertises.

@@ -4,9 +4,21 @@
  *
  * Implements the full UART packet exchange described at:
  * https://support.runcam.com/hc/en-us/articles/360014537794-RunCam-Device-Protocol
+ *
+ * CRC algorithm: CRC-8/DVB-S2 (polynomial 0xD5) — verified against the
+ * Betaflight reference implementation (src/main/io/rcdevice.c).
  */
 
 #include "RunCamManager.h"
+
+// ---------------------------------------------------------------------------
+// Expected response lengths for commands that have responses
+// ---------------------------------------------------------------------------
+
+/** Response sizes (total bytes including header and trailing CRC). */
+static constexpr uint8_t RESP_LEN_GET_DEVICE_INFO   = 5; ///< [hdr][ver][feat_lo][feat_hi][crc]
+static constexpr uint8_t RESP_LEN_OSD_KEY_ACK       = 2; ///< [hdr][crc]
+static constexpr uint8_t RESP_LEN_OSD_CONNECTION    = 3; ///< [hdr][status][crc]
 
 // ---------------------------------------------------------------------------
 // Construction & initialisation
@@ -22,7 +34,11 @@ RunCamManager::RunCamManager(HardwareSerial& serial,
       _baudRate(baudRate),
       _timeoutMs(RUNCAM_DEFAULT_TIMEOUT_MS),
       _initialized(false),
-      _deviceInfo{}
+      _deviceInfo{},
+      _attitude{},
+      _rxState(RxState::WaitingHeader),
+      _rxBuf{},
+      _rxBufLen(0)
 {
 }
 
@@ -38,9 +54,55 @@ bool RunCamManager::begin()
         _serial.read();
     }
 
-    // Try to retrieve device information; success means the camera is present.
+    // Try to retrieve device information; success confirms the camera is present.
     _initialized = getDeviceInfo(_deviceInfo);
     return _initialized;
+}
+
+// ---------------------------------------------------------------------------
+// Main loop update — handles unsolicited camera requests
+// ---------------------------------------------------------------------------
+
+void RunCamManager::update()
+{
+    // Process all available bytes through the lightweight state machine.
+    // We only handle camera-initiated requests here (currently: attitude 0x50).
+    // User commands are handled synchronously in their respective methods.
+    while (_serial.available()) {
+        const uint8_t byte = static_cast<uint8_t>(_serial.read());
+
+        switch (_rxState) {
+            case RxState::WaitingHeader:
+                if (byte == RUNCAM_HEADER) {
+                    _rxBuf[0]  = byte;
+                    _rxBufLen  = 1;
+                    _rxState   = RxState::WaitingCommand;
+                }
+                break;
+
+            case RxState::WaitingCommand:
+                _rxBuf[_rxBufLen++] = byte;
+                _rxState = RxState::WaitingCRC;
+                break;
+
+            case RxState::WaitingCRC:
+                _rxBuf[_rxBufLen++] = byte;
+
+                // Validate packet and dispatch.
+                if (validateCRC(_rxBuf, _rxBufLen)) {
+                    const auto cmd = static_cast<RunCamCommand>(_rxBuf[1]);
+                    if (cmd == RunCamCommand::RequestFCAttitude) {
+                        // Camera is requesting attitude data — respond immediately.
+                        sendAttitude();
+                    }
+                }
+
+                // Reset state machine for next packet.
+                _rxBufLen = 0;
+                _rxState  = RxState::WaitingHeader;
+                break;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -49,20 +111,21 @@ bool RunCamManager::begin()
 
 bool RunCamManager::getDeviceInfo(RunCamDeviceInfo& info)
 {
-    // Send request: [0xCC][0x00][CRC8]
+    // Flush stale RX bytes before sending.
+    while (_serial.available()) { _serial.read(); }
+
+    // Request: [0xCC][0x00][CRC8]
     sendPacket(RunCamCommand::GetDeviceInfo);
 
-    // Expected response layout (6 bytes):
+    // Response layout (5 bytes total):
     //   [0] 0xCC  – header
     //   [1]       – protocol version
     //   [2]       – features low byte
     //   [3]       – features high byte
-    //   [4]       – camera type
-    //   [5]       – CRC8
-    static constexpr uint8_t RESPONSE_LEN = 6;
-    uint8_t buf[RESPONSE_LEN];
+    //   [4]       – CRC8
+    uint8_t buf[RESP_LEN_GET_DEVICE_INFO];
 
-    if (!receiveBytes(buf, RESPONSE_LEN)) {
+    if (!receiveBytes(buf, RESP_LEN_GET_DEVICE_INFO)) {
         return false;
     }
 
@@ -70,14 +133,13 @@ bool RunCamManager::getDeviceInfo(RunCamDeviceInfo& info)
         return false;
     }
 
-    if (!validateCRC(buf, RESPONSE_LEN)) {
+    if (!validateCRC(buf, RESP_LEN_GET_DEVICE_INFO)) {
         return false;
     }
 
     info.protocolVersion = buf[1];
     info.features        = static_cast<uint16_t>(buf[2]) |
                            (static_cast<uint16_t>(buf[3]) << 8);
-    info.cameraType      = buf[4];
 
     return true;
 }
@@ -88,7 +150,7 @@ bool RunCamManager::isFeatureSupported(RunCamFeature feature) const
 }
 
 // ---------------------------------------------------------------------------
-// Camera control
+// Camera control (command 0x01)
 // ---------------------------------------------------------------------------
 
 bool RunCamManager::simulateWiFiButton()
@@ -117,21 +179,51 @@ bool RunCamManager::stopRecording()
 }
 
 // ---------------------------------------------------------------------------
-// 5-Key OSD navigation
+// 5-Key OSD connection management (command 0x04)
+// ---------------------------------------------------------------------------
+
+bool RunCamManager::openOSDConnection()
+{
+    return sendOSD5KeyConnection(RunCamOSD5KeyAction::Open);
+}
+
+bool RunCamManager::closeOSDConnection()
+{
+    return sendOSD5KeyConnection(RunCamOSD5KeyAction::Close);
+}
+
+// ---------------------------------------------------------------------------
+// 5-Key OSD navigation (commands 0x02 / 0x03)
 // ---------------------------------------------------------------------------
 
 bool RunCamManager::pressOSDKey(RunCamOSDKey key)
 {
+    if (key == RunCamOSDKey::None) {
+        return false;
+    }
+
     uint8_t payload = static_cast<uint8_t>(key);
     sendPacket(RunCamCommand::OSDKeyPress, &payload, 1);
-    return true;
+
+    // Wait for the 2-byte ACK: [0xCC][CRC8]
+    uint8_t buf[RESP_LEN_OSD_KEY_ACK];
+    if (!receiveBytes(buf, RESP_LEN_OSD_KEY_ACK)) {
+        return false;
+    }
+    return (buf[0] == RUNCAM_HEADER) && validateCRC(buf, RESP_LEN_OSD_KEY_ACK);
 }
 
-bool RunCamManager::releaseOSDKey(RunCamOSDKey key)
+bool RunCamManager::releaseOSDKey()
 {
-    uint8_t payload = static_cast<uint8_t>(key);
-    sendPacket(RunCamCommand::OSDKeyRelease, &payload, 1);
-    return true;
+    // Release carries NO key payload — it releases whatever is pressed.
+    sendPacket(RunCamCommand::OSDKeyRelease);
+
+    // Wait for the 2-byte ACK: [0xCC][CRC8]
+    uint8_t buf[RESP_LEN_OSD_KEY_ACK];
+    if (!receiveBytes(buf, RESP_LEN_OSD_KEY_ACK)) {
+        return false;
+    }
+    return (buf[0] == RUNCAM_HEADER) && validateCRC(buf, RESP_LEN_OSD_KEY_ACK);
 }
 
 bool RunCamManager::pressAndReleaseOSDKey(RunCamOSDKey key, uint32_t holdMs)
@@ -140,11 +232,48 @@ bool RunCamManager::pressAndReleaseOSDKey(RunCamOSDKey key, uint32_t holdMs)
         return false;
     }
     delay(holdMs);
-    return releaseOSDKey(key);
+    return releaseOSDKey();
 }
 
 // ---------------------------------------------------------------------------
-// CRC-8 (polynomial 0x07, initial value 0x00 – CRC-8/SMBUS)
+// Attitude data (command 0x50)
+// ---------------------------------------------------------------------------
+
+void RunCamManager::setAttitude(int16_t rollDecideg,
+                                int16_t pitchDecideg,
+                                int16_t yawDecideg)
+{
+    _attitude.roll  = rollDecideg;
+    _attitude.pitch = pitchDecideg;
+    _attitude.yaw   = yawDecideg;
+}
+
+void RunCamManager::setAttitudeDeg(float rollDeg, float pitchDeg, float yawDeg)
+{
+    _attitude.roll  = static_cast<int16_t>(rollDeg  * 10.0f);
+    _attitude.pitch = static_cast<int16_t>(pitchDeg * 10.0f);
+    _attitude.yaw   = static_cast<int16_t>(yawDeg   * 10.0f);
+}
+
+void RunCamManager::sendAttitude()
+{
+    // Payload: roll (int16 LE) + pitch (int16 LE) + yaw in whole degrees (int16 LE).
+    // Betaflight stores roll/pitch as decidegrees and converts yaw to whole degrees.
+    const int16_t yawDeg = _attitude.yaw / 10;
+
+    uint8_t payload[6];
+    payload[0] = static_cast<uint8_t>(_attitude.roll  & 0xFF);
+    payload[1] = static_cast<uint8_t>(_attitude.roll  >> 8);
+    payload[2] = static_cast<uint8_t>(_attitude.pitch & 0xFF);
+    payload[3] = static_cast<uint8_t>(_attitude.pitch >> 8);
+    payload[4] = static_cast<uint8_t>(yawDeg          & 0xFF);
+    payload[5] = static_cast<uint8_t>(yawDeg          >> 8);
+
+    sendPacket(RunCamCommand::RequestFCAttitude, payload, sizeof(payload));
+}
+
+// ---------------------------------------------------------------------------
+// CRC-8/DVB-S2 (polynomial 0xD5, initial value 0x00)
 // ---------------------------------------------------------------------------
 
 uint8_t RunCamManager::calculateCRC8(const uint8_t* data, uint8_t len)
@@ -154,7 +283,7 @@ uint8_t RunCamManager::calculateCRC8(const uint8_t* data, uint8_t len)
         crc ^= data[i];
         for (uint8_t bit = 0; bit < 8; bit++) {
             if (crc & 0x80) {
-                crc = static_cast<uint8_t>((crc << 1) ^ 0x07);
+                crc = static_cast<uint8_t>((crc << 1) ^ 0xD5);
             } else {
                 crc = static_cast<uint8_t>(crc << 1);
             }
@@ -171,8 +300,7 @@ void RunCamManager::sendPacket(RunCamCommand cmdId,
                                const uint8_t* data,
                                uint8_t dataLen)
 {
-    // Build the full packet in a local buffer:
-    //   [0xCC] [cmdId] [data...] [CRC8]
+    // Build: [0xCC][cmdId][data…][CRC8]
     uint8_t packet[RUNCAM_MAX_PACKET_SIZE];
     uint8_t idx = 0;
 
@@ -183,7 +311,6 @@ void RunCamManager::sendPacket(RunCamCommand cmdId,
         packet[idx++] = data[i];
     }
 
-    // Append CRC over all bytes written so far.
     packet[idx] = calculateCRC8(packet, idx);
     idx++;
 
@@ -219,5 +346,23 @@ bool RunCamManager::sendCameraControl(RunCamCameraAction action)
 {
     uint8_t payload = static_cast<uint8_t>(action);
     sendPacket(RunCamCommand::CameraControl, &payload, 1);
+    // Camera control commands do not produce a response packet.
     return true;
 }
+
+bool RunCamManager::sendOSD5KeyConnection(RunCamOSD5KeyAction action)
+{
+    // Flush stale RX bytes before sending.
+    while (_serial.available()) { _serial.read(); }
+
+    uint8_t payload = static_cast<uint8_t>(action);
+    sendPacket(RunCamCommand::OSD5KeyConnection, &payload, 1);
+
+    // Wait for the 3-byte ACK: [0xCC][status][CRC8]
+    uint8_t buf[RESP_LEN_OSD_CONNECTION];
+    if (!receiveBytes(buf, RESP_LEN_OSD_CONNECTION)) {
+        return false;
+    }
+    return (buf[0] == RUNCAM_HEADER) && validateCRC(buf, RESP_LEN_OSD_CONNECTION);
+}
+
