@@ -5,13 +5,16 @@
  * Provides a complete UART interface to RunCam cameras implementing the
  * official RunCam Device Protocol (https://support.runcam.com/hc/en-us/articles/360014537794).
  *
- * Packet structure:
+ * Packet structure (RunCam protocol):
  *   [Header 0xCC] [Command ID] [Optional Data...] [CRC8-DVB-S2]
+ *
+ * Packet structure (MSP DisplayPort):
+ *   ['$']['M']['<'] [Size] [182] [Sub-command] [Data...] [XOR checksum]
  *
  * CRC algorithm: CRC-8/DVB-S2 (polynomial 0xD5, init 0x00)
  *
  * @author   RunCamManagerLib
- * @version  1.1.0
+ * @version  1.2.0
  * @license  MIT
  */
 
@@ -33,8 +36,24 @@ static constexpr uint32_t RUNCAM_DEFAULT_BAUD = 115200;
 /** Default timeout (ms) waiting for a camera response. */
 static constexpr uint32_t RUNCAM_DEFAULT_TIMEOUT_MS = 500;
 
-/** Maximum number of bytes in a single packet (request or response). */
+/** Maximum number of bytes in a single RunCam packet (request or response). */
 static constexpr uint8_t RUNCAM_MAX_PACKET_SIZE = 64;
+
+// ---------------------------------------------------------------------------
+// OSD text overlay constants (MSP DisplayPort)
+// ---------------------------------------------------------------------------
+
+/** Maximum number of independent OSD text lines (0-based indices 0–9). */
+static constexpr uint8_t RUNCAM_OSD_MAX_LINES = 10;
+
+/** Maximum character length of a single OSD text line (excluding NUL). */
+static constexpr uint8_t RUNCAM_OSD_MAX_LINE_LEN = 20;
+
+/** Number of character columns in the camera OSD grid (standard SD = 30). */
+static constexpr uint8_t RUNCAM_OSD_COLUMNS = 30;
+
+/** First OSD row used for text lines (0 = top of screen). */
+static constexpr uint8_t RUNCAM_OSD_START_ROW = 0;
 
 // ---------------------------------------------------------------------------
 // Command IDs
@@ -48,6 +67,20 @@ enum class RunCamCommand : uint8_t {
     OSDKeyRelease      = 0x03, ///< Simulate a 5-key OSD remote button release (no key payload)
     OSD5KeyConnection  = 0x04, ///< Open or close the 5-key OSD cable connection
     RequestFCAttitude  = 0x50, ///< Camera requests / FC sends pitch/roll/yaw attitude data
+};
+
+// ---------------------------------------------------------------------------
+// MSP DisplayPort sub-commands (used internally for OSD text overlay)
+// ---------------------------------------------------------------------------
+
+/** @brief Sub-command values for MSP command 182 (DisplayPort). */
+enum class RunCamDisplayPortSub : uint8_t {
+    Heartbeat   = 0, ///< Keep-alive heartbeat (no payload)
+    Release     = 1, ///< Release / hand back the OSD screen
+    ClearScreen = 2, ///< Erase all characters on screen
+    WriteString = 3, ///< Write a character string at (row, col)
+    DrawScreen  = 4, ///< Commit buffered writes to the display
+    SetOptions  = 5, ///< Set display options (font size, etc.)
 };
 
 // ---------------------------------------------------------------------------
@@ -416,6 +449,61 @@ public:
     const RunCamAttitude& getAttitude() const { return _attitude; }
 
     // -----------------------------------------------------------------------
+    // OSD text lines for video overlay (MSP DisplayPort, command 182)
+    // -----------------------------------------------------------------------
+
+    /**
+     * @brief Set the text for a numbered OSD line.
+     *
+     * Lines are displayed in the **top-right corner** of the video frame, one
+     * per row, right-aligned so the last character touches the right edge of
+     * the OSD grid.  Call sendOSDLines() to push pending changes to the camera.
+     *
+     * @param lineIndex  Line number, 0–(RUNCAM_OSD_MAX_LINES–1).
+     *                   Line 0 is the topmost row.
+     * @param text       NUL-terminated string (max RUNCAM_OSD_MAX_LINE_LEN
+     *                   chars; longer strings are silently truncated).
+     */
+    void setOSDLine(uint8_t lineIndex, const char* text);
+
+    /**
+     * @brief Clear a single OSD line.
+     *
+     * The line will not be drawn on the next sendOSDLines() call.
+     *
+     * @param lineIndex  Line number to clear, 0–(RUNCAM_OSD_MAX_LINES–1).
+     */
+    void clearOSDLine(uint8_t lineIndex);
+
+    /**
+     * @brief Clear all OSD text lines.
+     *
+     * After this call, sendOSDLines() will issue a screen-clear with no text.
+     */
+    void clearAllOSDLines();
+
+    /**
+     * @brief Push all active OSD text lines to the camera via MSP DisplayPort.
+     *
+     * Sends the following MSP DisplayPort sequence:
+     *   1. CLEAR_SCREEN  — erases the previous overlay
+     *   2. WRITE_STRING  — one packet per active line, right-aligned
+     *   3. DRAW_SCREEN   — commits the buffered characters to the display
+     *
+     * Call this whenever lines change, or periodically (e.g. every 200 ms) to
+     * keep the overlay visible.
+     *
+     * The camera must support the DisplayPort feature
+     * (RunCamFeature::DisplayPort) for the overlay to appear on video.
+     * Calling this method on a camera that does not support DisplayPort is safe
+     * but has no visible effect.
+     *
+     * @return true  if at least one line was written; false if all lines are
+     *               empty (a CLEAR_SCREEN + DRAW_SCREEN is still sent).
+     */
+    bool sendOSDLines();
+
+    // -----------------------------------------------------------------------
     // Configuration
     // -----------------------------------------------------------------------
 
@@ -483,6 +571,18 @@ private:
     /** Open or close the 5-key OSD connection and wait for ACK. */
     bool sendOSD5KeyConnection(RunCamOSD5KeyAction action);
 
+    /**
+     * @brief Transmit a raw MSP v1 packet (used for DisplayPort commands).
+     *
+     * Frame layout: '$' 'M' '<' [payloadLen] [cmd] [payload…] [XOR checksum]
+     * The XOR checksum covers payloadLen, cmd, and every payload byte.
+     *
+     * @param cmd        MSP command byte (e.g. 182 for DISPLAYPORT).
+     * @param payload    Payload bytes (may be nullptr if payloadLen == 0).
+     * @param payloadLen Number of payload bytes.
+     */
+    void sendMSPPacket(uint8_t cmd, const uint8_t* payload, uint8_t payloadLen);
+
     // -----------------------------------------------------------------------
     // Private state for update() / attitude request handler
     // -----------------------------------------------------------------------
@@ -509,4 +609,8 @@ private:
     RxState          _rxState;      ///< State machine state for update()
     uint8_t          _rxBuf[3];     ///< Accumulation buffer for update() parser
     uint8_t          _rxBufLen;     ///< Number of bytes collected so far
+
+    // OSD text overlay state
+    char  _osdLines[RUNCAM_OSD_MAX_LINES][RUNCAM_OSD_MAX_LINE_LEN + 1]; ///< Text per line
+    bool  _osdLineActive[RUNCAM_OSD_MAX_LINES];                          ///< Set = line has content
 };

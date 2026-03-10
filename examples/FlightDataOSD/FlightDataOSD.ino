@@ -1,47 +1,45 @@
 /**
  * @file FlightDataOSD.ino
- * @brief RunCamManagerLib - Flight Data OSD Overlay example for ESP32-S3
+ * @brief RunCamManagerLib - Custom Text OSD Overlay example for ESP32-S3
  *
- * Demonstrates how to send flight telemetry (roll, pitch, yaw) to a RunCam
- * camera so that it can be displayed as an OSD overlay on the recorded video.
+ * Demonstrates how to display up to 10 numbered text lines in the top-right
+ * corner of the video using the RunCam DisplayPort OSD feature (MSP protocol).
  *
- * How it works:
- *   1. The camera periodically sends a command 0x50 "Request FC Attitude"
- *      packet to ask for the current attitude.
- *   2. cam.update() (called every loop iteration) detects this request and
- *      automatically responds with the last values set by setAttitude() /
- *      setAttitudeDeg().
- *   3. You can also call cam.sendAttitude() proactively at any time.
+ * API summary:
+ *   camera.setOSDLine(0, "State: UP");   // set line 0 text
+ *   camera.setOSDLine(1, "Alt.: 45.3m"); // set line 1 text
+ *   camera.clearOSDLine(2);              // remove line 2
+ *   camera.clearAllOSDLines();           // remove all lines
+ *   camera.sendOSDLines();               // push changes to camera
  *
- * The camera must advertise RunCamFeature::FcAttitude to use this feature.
+ * Lines are right-aligned and placed at the top of the screen (rows 0–9).
+ * The camera must advertise RunCamFeature::DisplayPort for the overlay to
+ * appear on the recorded video.
+ *
+ * Replace the placeholder strings and snprintf values below with data from
+ * your own sensors (IMU, barometer, GPS, etc.).
  *
  * Wiring (adjust pins to your board):
  *   ESP32-S3 GPIO16 (RX2) <-- RunCam TX
  *   ESP32-S3 GPIO17 (TX2) --> RunCam RX
  *   GND ------------------- GND (shared ground required)
- *
- * In this example, simulated attitude values (sine wave) are used in place of
- * a real IMU. Replace the simulation block with your sensor data.
  */
 
 #include <Arduino.h>
-#include <math.h>
 #include <RunCamManager.h>
 
 // ---------------------------------------------------------------------------
 // Pin & serial configuration - adjust to your wiring
 // ---------------------------------------------------------------------------
-static constexpr uint8_t  CAM_RX_PIN = 16;
-static constexpr uint8_t  CAM_TX_PIN = 17;
+static constexpr uint8_t CAM_RX_PIN = 16;
+static constexpr uint8_t CAM_TX_PIN = 17;
 
 RunCamManager camera(Serial2, CAM_RX_PIN, CAM_TX_PIN);
 
 // ---------------------------------------------------------------------------
-// Simulated attitude state (replace with real IMU values)
+// Helper: format a value into a line buffer and set it on the camera
 // ---------------------------------------------------------------------------
-static float simRoll  = 0.0f; // degrees
-static float simPitch = 0.0f; // degrees
-static float simYaw   = 0.0f; // degrees
+static char lineBuf[RUNCAM_OSD_MAX_LINE_LEN + 1];
 
 // ---------------------------------------------------------------------------
 void setup()
@@ -49,7 +47,7 @@ void setup()
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println("=== RunCamManagerLib - Flight Data OSD Overlay ===");
+    Serial.println("=== RunCamManagerLib - Custom OSD Text Overlay ===");
     Serial.println("Initialising camera...");
 
     if (!camera.begin()) {
@@ -59,42 +57,55 @@ void setup()
 
     Serial.println("Camera connected!");
 
-    if (!camera.isFeatureSupported(RunCamFeature::FcAttitude)) {
-        Serial.println("WARNING: This camera does not advertise FcAttitude support.");
-        Serial.println("         Attitude data will still be sent; the camera");
-        Serial.println("         may display it if the feature is actually present.");
+    if (!camera.isFeatureSupported(RunCamFeature::DisplayPort)) {
+        Serial.println("WARNING: Camera does not advertise DisplayPort support.");
+        Serial.println("         Text overlay may not appear on this model.");
     }
 
-    Serial.println("Streaming flight data to camera OSD...");
-    Serial.println("(Roll and Pitch simulate a slow bank; Yaw advances at 10 deg/s)");
+    // ---- Set static OSD lines (these do not change while flying) ----------
+    // Line 0: flight state label (update dynamically as needed)
+    camera.setOSDLine(0, "State: IDLE");
+
+    // Lines 1-3 will be updated each loop with live sensor values.
+    // Lines 4-9 are available for additional data (GPS, battery, etc.).
+
+    Serial.println("OSD text overlay active. Update lines via setOSDLine().");
 }
 
 // ---------------------------------------------------------------------------
 void loop()
 {
-    // ---- 1. Update simulated sensor values (replace with your IMU) --------
-    const float t = millis() / 1000.0f;
+    // ---- 1. Read your sensor values here ----------------------------------
+    // Replace these placeholders with actual readings from your hardware.
+    // For example:
+    //   float altitude = baro.getAltitude();
+    //   float speed    = gps.getSpeedMs();
+    //   float accel    = imu.getAccelMs2();
 
-    simRoll  = 30.0f * sinf(t * 0.5f);        // +-30 deg bank
-    simPitch = 10.0f * sinf(t * 0.3f + 1.0f); // +-10 deg pitch
-    simYaw   = fmodf(t * 10.0f, 360.0f);       // 10 deg/s heading sweep
+    // (Placeholder values for demonstration — remove in real usage.)
+    static float altitude = 0.0f;
+    altitude += 0.05f;
+    if (altitude > 200.0f) altitude = 0.0f;
 
-    // ---- 2. Push attitude to the library (decidegrees = degrees x 10) -----
-    camera.setAttitudeDeg(simRoll, simPitch, simYaw);
+    // ---- 2. Update dynamic OSD lines with fresh sensor values -------------
+    static uint32_t lastOsdUpdate = 0;
+    if (millis() - lastOsdUpdate >= 200) { // ~5 Hz refresh
+        lastOsdUpdate = millis();
 
-    // ---- 3. Optionally send proactively (camera also requests via 0x50) ---
-    camera.sendAttitude();
+        // Line 1: altitude
+        snprintf(lineBuf, sizeof(lineBuf), "Alt.: %5.1fm", altitude);
+        camera.setOSDLine(1, lineBuf);
 
-    // ---- 4. Process any incoming camera requests (e.g. attitude requests) --
-    camera.update();
+        // Add more lines here, e.g.:
+        // snprintf(lineBuf, sizeof(lineBuf), "Speed:%4.1fm/s", speed);
+        // camera.setOSDLine(2, lineBuf);
 
-    // ---- 5. Debug output every second ------------------------------------
-    static uint32_t lastPrint = 0;
-    if (millis() - lastPrint >= 1000) {
-        lastPrint = millis();
-        Serial.printf("Attitude sent -> Roll: %+6.1f deg  Pitch: %+6.1f deg  Yaw: %5.1f deg\n",
-                      simRoll, simPitch, simYaw);
+        // ---- 3. Push all active lines to the camera -----------------------
+        camera.sendOSDLines();
+
+        Serial.printf("OSD line 1 -> \"%s\"\n", lineBuf);
     }
 
-    delay(50); // ~20 Hz update rate
+    // ---- 4. Handle any incoming camera requests (e.g. attitude 0x50) -----
+    camera.update();
 }

@@ -1,7 +1,7 @@
 {
   "name": "RunCamManagerLib",
-  "version": "1.1.0",
-  "description": "Full UART interface library for RunCam cameras on ESP32-S3 (Arduino / PlatformIO), implementing the complete RunCam Device Protocol (CRC-8/DVB-S2, all commands).",
+  "version": "1.2.0",
+  "description": "Full UART interface library for RunCam cameras on ESP32-S3 (Arduino / PlatformIO), implementing the complete RunCam Device Protocol (CRC-8/DVB-S2, all commands) plus MSP DisplayPort OSD text overlay.",
   "keywords": ["runcam", "fpv", "uart", "camera", "osd", "attitude", "esp32", "esp32-s3"],
   "repository": {
     "type": "git",

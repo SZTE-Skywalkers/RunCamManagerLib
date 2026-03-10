@@ -7,6 +7,7 @@
  *   - Camera control (recording, mode, button simulation)
  *   - 5-key OSD navigation (open connection, press/release, close connection)
  *   - Attitude data transmission for OSD overlay (flight data on video)
+ *   - Custom text OSD overlay via MSP DisplayPort (up to 10 numbered lines)
  *   - Custom response timeout configuration
  *   - Low-level CRC8-DVB-S2 utility
  *
@@ -34,6 +35,7 @@ void printDeviceInfo(const RunCamDeviceInfo& info);
 void runRecordingDemo();
 void runOSDDemo();
 void runAttitudeDemo();
+void runTextOverlayDemo();
 
 // ---------------------------------------------------------------------------
 void setup()
@@ -73,10 +75,14 @@ void setup()
     runOSDDemo();
 
     // ---- Attitude / flight data OSD overlay demo --------------------------
-    Serial.println("\n[5/5] Attitude OSD overlay demo (requires FcAttitude)");
+    Serial.println("\n[5/6] Attitude OSD overlay demo (requires FcAttitude)");
     runAttitudeDemo();
 
-    Serial.println("\nDemo complete. Entering continuous attitude streaming...");
+    // ---- Text overlay demo ------------------------------------------------
+    Serial.println("\n[6/6] Custom text OSD overlay demo (requires DisplayPort)");
+    runTextOverlayDemo();
+
+    Serial.println("\nDemo complete. Entering continuous attitude + text streaming...");
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +92,19 @@ void loop()
     // Replace these constants with your actual IMU sensor readings.
     camera.setAttitude(0, 50, 1800); // 0 deg roll, 5 deg pitch, 180 deg yaw
     camera.sendAttitude();
+
+    // Refresh the text overlay periodically with updated sensor values.
+    // Replace the placeholder string with your actual data.
+    static uint32_t lastOsdUpdate = 0;
+    if (millis() - lastOsdUpdate >= 200) {
+        lastOsdUpdate = millis();
+        // Example: update line 0 with a live counter (replace with real data).
+        char osdTimeBuf[RUNCAM_OSD_MAX_LINE_LEN + 1];
+        snprintf(osdTimeBuf, sizeof(osdTimeBuf), "T: %lums", millis() / 1000UL);
+        camera.setOSDLine(0, osdTimeBuf);
+        camera.sendOSDLines();
+    }
+
     camera.update(); // handles any incoming camera requests (e.g. 0x50)
     delay(50);
 }
@@ -194,4 +213,50 @@ void runAttitudeDemo()
     }
 
     Serial.println("  Attitude demo complete.");
+}
+
+// ---------------------------------------------------------------------------
+// Helper: Custom text OSD overlay demo (MSP DisplayPort)
+// ---------------------------------------------------------------------------
+void runTextOverlayDemo()
+{
+    if (!camera.isFeatureSupported(RunCamFeature::DisplayPort)) {
+        Serial.println("  DisplayPort not advertised - will try anyway.");
+    }
+
+    Serial.println("  Setting 4 OSD text lines...");
+
+    // Set static and dynamic lines.
+    camera.setOSDLine(0, "State: DEMO");
+    camera.setOSDLine(1, "Alt.:   0.0m");
+    camera.setOSDLine(2, "Speed:  0m/s");
+    camera.setOSDLine(3, "Acc.:  0m/s^2");
+
+    // Stream the overlay for 5 seconds, updating line 1 each iteration.
+    const uint32_t endTime = millis() + 5000;
+    uint32_t lastUpdate    = 0;
+    float    fakeAlt       = 0.0f;
+
+    while (millis() < endTime) {
+        if (millis() - lastUpdate >= 200) {
+            lastUpdate = millis();
+
+            // Update one line with a changing value.
+            fakeAlt += 0.5f;
+            char altLineBuf[RUNCAM_OSD_MAX_LINE_LEN + 1];
+            snprintf(altLineBuf, sizeof(altLineBuf), "Alt.: %5.1fm", fakeAlt);
+            camera.setOSDLine(1, altLineBuf);
+
+            camera.sendOSDLines();
+            Serial.printf("  Sent -> \"%s\"\n", altLineBuf);
+        }
+        camera.update();
+        delay(20);
+    }
+
+    // Clear all lines when done.
+    camera.clearAllOSDLines();
+    camera.sendOSDLines();
+
+    Serial.println("  Text overlay demo complete.");
 }

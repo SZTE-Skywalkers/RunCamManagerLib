@@ -38,7 +38,9 @@ RunCamManager::RunCamManager(HardwareSerial& serial,
       _attitude{},
       _rxState(RxState::WaitingHeader),
       _rxBuf{},
-      _rxBufLen(0)
+      _rxBufLen(0),
+      _osdLines{},
+      _osdLineActive{}
 {
 }
 
@@ -273,6 +275,76 @@ void RunCamManager::sendAttitude()
 }
 
 // ---------------------------------------------------------------------------
+// OSD text lines (MSP DisplayPort, command 182)
+// ---------------------------------------------------------------------------
+
+/** MSP command byte for DisplayPort sub-protocol. */
+static constexpr uint8_t MSP_CMD_DISPLAYPORT = 182;
+
+void RunCamManager::setOSDLine(uint8_t lineIndex, const char* text)
+{
+    if (lineIndex >= RUNCAM_OSD_MAX_LINES) return;
+    strncpy(_osdLines[lineIndex], text, RUNCAM_OSD_MAX_LINE_LEN);
+    _osdLines[lineIndex][RUNCAM_OSD_MAX_LINE_LEN] = '\0';
+    _osdLineActive[lineIndex] = true;
+}
+
+void RunCamManager::clearOSDLine(uint8_t lineIndex)
+{
+    if (lineIndex >= RUNCAM_OSD_MAX_LINES) return;
+    _osdLines[lineIndex][0] = '\0';
+    _osdLineActive[lineIndex] = false;
+}
+
+void RunCamManager::clearAllOSDLines()
+{
+    for (uint8_t i = 0; i < RUNCAM_OSD_MAX_LINES; i++) {
+        clearOSDLine(i);
+    }
+}
+
+bool RunCamManager::sendOSDLines()
+{
+    // 1. Clear the OSD screen (sub-command 2 = CLEAR_SCREEN).
+    {
+        const uint8_t sub = static_cast<uint8_t>(RunCamDisplayPortSub::ClearScreen);
+        sendMSPPacket(MSP_CMD_DISPLAYPORT, &sub, 1);
+    }
+
+    bool anyActive = false;
+
+    for (uint8_t i = 0; i < RUNCAM_OSD_MAX_LINES; i++) {
+        if (!_osdLineActive[i] || _osdLines[i][0] == '\0') continue;
+
+        const uint8_t textLen = static_cast<uint8_t>(strlen(_osdLines[i]));
+
+        // Right-align: last character sits at the right edge of the OSD grid.
+        const uint8_t col = (textLen <= RUNCAM_OSD_COLUMNS)
+                          ? (RUNCAM_OSD_COLUMNS - textLen)
+                          : 0u;
+
+        // Payload layout: [sub_cmd=3][row][col][attr=0][chars…]
+        uint8_t payload[4 + RUNCAM_OSD_MAX_LINE_LEN];
+        payload[0] = static_cast<uint8_t>(RunCamDisplayPortSub::WriteString);
+        payload[1] = static_cast<uint8_t>(RUNCAM_OSD_START_ROW + i);
+        payload[2] = col;
+        payload[3] = 0; // no text attribute flags
+        memcpy(payload + 4, _osdLines[i], textLen);
+
+        sendMSPPacket(MSP_CMD_DISPLAYPORT, payload, static_cast<uint8_t>(4u + textLen));
+        anyActive = true;
+    }
+
+    // 3. Commit buffered writes to the display (sub-command 4 = DRAW_SCREEN).
+    {
+        const uint8_t sub = static_cast<uint8_t>(RunCamDisplayPortSub::DrawScreen);
+        sendMSPPacket(MSP_CMD_DISPLAYPORT, &sub, 1);
+    }
+
+    return anyActive;
+}
+
+// ---------------------------------------------------------------------------
 // CRC-8/DVB-S2 (polynomial 0xD5, initial value 0x00)
 // ---------------------------------------------------------------------------
 
@@ -364,5 +436,25 @@ bool RunCamManager::sendOSD5KeyConnection(RunCamOSD5KeyAction action)
         return false;
     }
     return (buf[0] == RUNCAM_HEADER) && validateCRC(buf, RESP_LEN_OSD_CONNECTION);
+}
+
+void RunCamManager::sendMSPPacket(uint8_t cmd,
+                                  const uint8_t* payload,
+                                  uint8_t payloadLen)
+{
+    // MSP v1 frame: '$' 'M' '<' [payloadLen] [cmd] [payload…] [XOR checksum]
+    // Checksum = payloadLen XOR cmd XOR each payload byte.
+    _serial.write('$');
+    _serial.write('M');
+    _serial.write('<');
+    _serial.write(payloadLen);
+    _serial.write(cmd);
+
+    uint8_t xorSum = payloadLen ^ cmd;
+    for (uint8_t i = 0; i < payloadLen; i++) {
+        _serial.write(payload[i]);
+        xorSum ^= payload[i];
+    }
+    _serial.write(xorSum);
 }
 
