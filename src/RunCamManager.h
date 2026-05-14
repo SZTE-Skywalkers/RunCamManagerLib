@@ -1,616 +1,590 @@
 /**
- * @file RunCamManager.h
- * @brief RunCam Device Protocol library for ESP32-S3 (Arduino / PlatformIO)
+ * @file    RunCamManager.h
+ * @brief   RunCam Device Protocol driver for ESP32 / ESP32-S3 (Arduino).
  *
- * Provides a complete UART interface to RunCam cameras implementing the
- * official RunCam Device Protocol (https://support.runcam.com/hc/en-us/articles/360014537794).
+ * @details
+ * Full UART driver for RunCam cameras implementing the official
+ * RunCam Device Protocol (https://support.runcam.com/hc/en-us/articles/360014537794).
  *
- * Packet structure (RunCam protocol):
- *   [Header 0xCC] [Command ID] [Optional Data...] [CRC8-DVB-S2]
+ * Supported features (all commands defined in the RunCam Device Protocol):
+ *  - Get Device Info                       (command 0x00)
+ *  - Camera Control                        (command 0x01)
+ *      * Simulate Wi-Fi / Power button
+ *      * Change mode
+ *      * Start / stop recording
+ *  - 5-Key OSD Cable Simulation
+ *      * Key press                         (command 0x02)
+ *      * Key release                       (command 0x03)
+ *      * Connection open / close           (command 0x04)
+ *  - FC Attitude data exchange             (command 0x50)
+ *  - MSP DisplayPort text overlay          (MSP command 182)
+ *      * Heartbeat / Release / Clear / Write / Draw / Options
  *
- * Packet structure (MSP DisplayPort):
- *   ['$']['M']['<'] [Size] [182] [Sub-command] [Data...] [XOR checksum]
+ * Frame layouts:
+ *  - RunCam protocol : [0xCC] [Command] [Payload...] [CRC-8/DVB-S2]
+ *  - MSP DisplayPort : ['$']['M']['<'] [Size] [Cmd] [Payload...] [XOR-checksum]
  *
- * CRC algorithm: CRC-8/DVB-S2 (polynomial 0xD5, init 0x00)
+ * Design rules applied (subset of JSF AV C++):
+ *  - No dynamic memory allocation, no exceptions, no RTTI.
+ *  - All members initialised in-class; class is non-copyable, non-movable, final.
+ *  - All fallible methods return RunCamManagerStatus; failure modes are explicit.
+ *  - All loops are bounded; all array accesses are range-checked.
+ *  - Hardware binding happens in begin(), never in the constructor.
+ *  - All named constants use constexpr; no preprocessor macros for values.
+ *  - All identifiers and documentation are in English.
  *
- * @author   RunCamManagerLib
- * @version  1.2.0
- * @license  MIT
+ * @author  RunCamManagerLib
+ * @version 2.0.0
+ * @license MIT
  */
 
 #pragma once
 
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include <stdint.h>
 
-// ---------------------------------------------------------------------------
+// =============================================================================
 // Protocol constants
-// ---------------------------------------------------------------------------
+// =============================================================================
 
-/** Start-of-frame marker for every RunCam packet. */
-static constexpr uint8_t RUNCAM_HEADER = 0xCC;
+/** Start-of-frame marker of every RunCam protocol packet. */
+static constexpr uint8_t  RUNCAM_HEADER             = 0xCCu;
 
 /** Default UART baud rate used by RunCam cameras. */
-static constexpr uint32_t RUNCAM_DEFAULT_BAUD = 115200;
+static constexpr uint32_t RUNCAM_DEFAULT_BAUD       = 115200u;
 
-/** Default timeout (ms) waiting for a camera response. */
-static constexpr uint32_t RUNCAM_DEFAULT_TIMEOUT_MS = 500;
+/** Default timeout (milliseconds) for camera responses. */
+static constexpr uint32_t RUNCAM_DEFAULT_TIMEOUT_MS = 500u;
 
-/** Maximum number of bytes in a single RunCam packet (request or response). */
-static constexpr uint8_t RUNCAM_MAX_PACKET_SIZE = 64;
+/** Maximum number of bytes in any single RunCam packet (request or response). */
+static constexpr uint8_t  RUNCAM_MAX_PACKET_SIZE    = 64u;
 
-// ---------------------------------------------------------------------------
+/** Maximum payload bytes in an MSP DisplayPort frame (header + checksum excluded). */
+static constexpr uint8_t  RUNCAM_MSP_MAX_PAYLOAD    = 64u;
+
+// =============================================================================
 // OSD text overlay constants (MSP DisplayPort)
-// ---------------------------------------------------------------------------
+// =============================================================================
 
-/** Maximum number of independent OSD text lines (0-based indices 0–9). */
-static constexpr uint8_t RUNCAM_OSD_MAX_LINES = 10;
+/** Number of independent OSD text rows the driver tracks. */
+static constexpr uint8_t  RUNCAM_OSD_MAX_LINES      = 10u;
 
-/** Maximum character length of a single OSD text line (excluding NUL). */
-static constexpr uint8_t RUNCAM_OSD_MAX_LINE_LEN = 20;
+/** Maximum visible characters per OSD text row (excluding terminating NUL). */
+static constexpr uint8_t  RUNCAM_OSD_MAX_LINE_LEN   = 20u;
 
-/** Number of character columns in the camera OSD grid (standard SD = 30). */
-static constexpr uint8_t RUNCAM_OSD_COLUMNS = 30;
+/** Number of character columns in the standard RunCam OSD grid (SD). */
+static constexpr uint8_t  RUNCAM_OSD_COLUMNS        = 30u;
 
-/** First OSD row used for text lines (0 = top of screen). */
-static constexpr uint8_t RUNCAM_OSD_START_ROW = 0;
+/** First OSD row used for text lines (row 0 = top of screen). */
+static constexpr uint8_t  RUNCAM_OSD_START_ROW      = 0u;
 
-// ---------------------------------------------------------------------------
-// Command IDs
-// ---------------------------------------------------------------------------
-
-/** @brief RunCam protocol command identifiers. */
-enum class RunCamCommand : uint8_t {
-    GetDeviceInfo      = 0x00, ///< Query protocol version and feature flags
-    CameraControl      = 0x01, ///< Simulate hardware button presses / recording
-    OSDKeyPress        = 0x02, ///< Simulate a 5-key OSD remote button press
-    OSDKeyRelease      = 0x03, ///< Simulate a 5-key OSD remote button release (no key payload)
-    OSD5KeyConnection  = 0x04, ///< Open or close the 5-key OSD cable connection
-    RequestFCAttitude  = 0x50, ///< Camera requests / FC sends pitch/roll/yaw attitude data
-};
-
-// ---------------------------------------------------------------------------
-// MSP DisplayPort sub-commands (used internally for OSD text overlay)
-// ---------------------------------------------------------------------------
-
-/** @brief Sub-command values for MSP command 182 (DisplayPort). */
-enum class RunCamDisplayPortSub : uint8_t {
-    Heartbeat   = 0, ///< Keep-alive heartbeat (no payload)
-    Release     = 1, ///< Release / hand back the OSD screen
-    ClearScreen = 2, ///< Erase all characters on screen
-    WriteString = 3, ///< Write a character string at (row, col)
-    DrawScreen  = 4, ///< Commit buffered writes to the display
-    SetOptions  = 5, ///< Set display options (font size, etc.)
-};
-
-// ---------------------------------------------------------------------------
-// Feature flags (returned by GetDeviceInfo)
-// ---------------------------------------------------------------------------
-
-/** @brief Bitmask of optional features a RunCam device may support. */
-enum class RunCamFeature : uint16_t {
-    SimulatePowerButton  = (1u << 0), ///< Simulate the power / shutter button
-    SimulateWiFiButton   = (1u << 1), ///< Simulate the Wi-Fi pairing button
-    ChangeMode           = (1u << 2), ///< Switch between video / photo / etc. modes
-    Simulate5KeyOSD      = (1u << 3), ///< Navigate OSD via 5-key remote emulation
-    DeviceSettingsAccess = (1u << 4), ///< Read / write device settings via OSD
-    DisplayPort          = (1u << 5), ///< Receive DisplayPort OSD overlay data from FC
-    StartRecording       = (1u << 6), ///< Start video recording
-    StopRecording        = (1u << 7), ///< Stop video recording
-    CmsMenu              = (1u << 8), ///< CMS (Configuration Menu System) menu access
-    FcAttitude           = (1u << 9), ///< Camera can request attitude data from FC
-};
-
-// ---------------------------------------------------------------------------
-// Camera control actions (used with RunCamCommand::CameraControl)
-// ---------------------------------------------------------------------------
-
-/** @brief Actions available via the Camera Control command (0x01). */
-enum class RunCamCameraAction : uint8_t {
-    SimulateWiFiButton  = 0x00, ///< Simulate Wi-Fi button press
-    SimulatePowerButton = 0x01, ///< Simulate power button press
-    ChangeMode          = 0x02, ///< Change camera operating mode
-    StartRecording      = 0x03, ///< Start recording
-    StopRecording       = 0x04, ///< Stop recording
-};
-
-// ---------------------------------------------------------------------------
-// 5-Key OSD key identifiers
-// (matches rcdevice_5key_simulation_operation_e in Betaflight / iNav)
-// ---------------------------------------------------------------------------
-
-/** @brief Keys available on the 5-key OSD remote. */
-enum class RunCamOSDKey : uint8_t {
-    None   = 0x00, ///< No key (used internally)
-    Center = 0x01, ///< Confirm / enter / SET
-    Left   = 0x02, ///< Navigate left / back
-    Right  = 0x03, ///< Navigate right / forward
-    Up     = 0x04, ///< Navigate up
-    Down   = 0x05, ///< Navigate down
-};
-
-// ---------------------------------------------------------------------------
-// 5-Key OSD connection actions
-// ---------------------------------------------------------------------------
-
-/** @brief Open or close the 5-key OSD cable connection (command 0x04). */
-enum class RunCamOSD5KeyAction : uint8_t {
-    Open  = 0x01, ///< Open (enable) the 5-key OSD connection
-    Close = 0x02, ///< Close (disable) the 5-key OSD connection
-};
-
-// ---------------------------------------------------------------------------
-// Attitude data structure
-// ---------------------------------------------------------------------------
+// =============================================================================
+// Status type
+// =============================================================================
 
 /**
- * @brief Attitude values (roll / pitch / yaw) sent to the camera for OSD overlay.
+ * @brief Return code for all fallible RunCamManager operations.
  *
- * All values are in **decidegrees** (tenths of a degree, e.g. 450 = 45.0°).
- * This matches the native resolution of Betaflight's attitude estimator.
- * When transmitted to the camera, yaw is converted to whole degrees.
+ * The status type is deliberately small (uint8_t) and totally ordered so that
+ * callers can use simple comparisons or a switch statement.
+ *
+ * Use RunCamManager::statusToString() to obtain a human-readable description.
  */
-struct RunCamAttitude {
-    int16_t roll;  ///< Roll  angle in decidegrees (-1800 to +1800)
-    int16_t pitch; ///< Pitch angle in decidegrees (-900 to +900)
-    int16_t yaw;   ///< Yaw   angle in decidegrees (0 to +3600)
+enum class RunCamManagerStatus : uint8_t {
+    Ok                  = 0u, ///< Operation completed successfully.
+    NotInitialized      = 1u, ///< begin() has not been called or it failed.
+    AlreadyInitialized  = 2u, ///< begin() called twice without an intervening end().
+    InvalidParameter    = 3u, ///< Caller supplied an out-of-range or null argument.
+    SerialError         = 4u, ///< Underlying HardwareSerial reported an error.
+    Timeout             = 5u, ///< Camera did not respond within the configured timeout.
+    CrcError            = 6u, ///< Response received but CRC validation failed.
+    InvalidResponse     = 7u, ///< Response shape did not match the expected layout.
+    UnsupportedFeature  = 8u, ///< Cached device info does not advertise the feature.
+    ConnectionClosed    = 9u, ///< OSD 5-key connection is not currently open.
+    BufferOverflow      = 10u ///< Internal buffer would overflow; request rejected.
 };
 
-// ---------------------------------------------------------------------------
-// Device information structure
-// ---------------------------------------------------------------------------
+// =============================================================================
+// Protocol enumerations
+// =============================================================================
 
-/** @brief Information returned by the camera in response to GetDeviceInfo. */
+/** RunCam Device Protocol command identifiers (header byte 0xCC follows). */
+enum class RunCamCommand : uint8_t {
+    GetDeviceInfo      = 0x00u, ///< Query protocol version and feature bitmask.
+    CameraControl      = 0x01u, ///< Simulate hardware button or recording action.
+    OSDKeyPress        = 0x02u, ///< Simulate a 5-key OSD remote button press.
+    OSDKeyRelease      = 0x03u, ///< Simulate a 5-key OSD remote button release.
+    OSD5KeyConnection  = 0x04u, ///< Open or close the 5-key OSD connection.
+    RequestFCAttitude  = 0x50u  ///< Bidirectional attitude data (pitch/roll/yaw).
+};
+
+/** Actions usable with RunCamCommand::CameraControl (0x01). */
+enum class RunCamCameraAction : uint8_t {
+    SimulateWiFiButton  = 0x00u, ///< Simulate the Wi-Fi pairing button.
+    SimulatePowerButton = 0x01u, ///< Simulate the power / shutter button.
+    ChangeMode          = 0x02u, ///< Cycle to the next operating mode.
+    StartRecording      = 0x03u, ///< Begin video recording.
+    StopRecording       = 0x04u  ///< Stop video recording.
+};
+
+/** Keys available on the simulated 5-key OSD remote. */
+enum class RunCamOSDKey : uint8_t {
+    None   = 0x00u, ///< Sentinel — not a valid key payload.
+    Center = 0x01u, ///< Confirm / enter / SET.
+    Left   = 0x02u, ///< Navigate left / back.
+    Right  = 0x03u, ///< Navigate right / forward.
+    Up     = 0x04u, ///< Navigate up.
+    Down   = 0x05u  ///< Navigate down.
+};
+
+/** Open / close action for the 5-key OSD connection (command 0x04). */
+enum class RunCamOSD5KeyAction : uint8_t {
+    Open  = 0x01u, ///< Open (enable)  the 5-key OSD connection.
+    Close = 0x02u  ///< Close (disable) the 5-key OSD connection.
+};
+
+/** Sub-commands of MSP command 182 (DisplayPort). */
+enum class RunCamDisplayPortSub : uint8_t {
+    Heartbeat   = 0u, ///< Keep-alive (no payload).
+    Release     = 1u, ///< Release / hand back the OSD screen.
+    ClearScreen = 2u, ///< Erase all characters on screen.
+    WriteString = 3u, ///< Write a character string at (row, col).
+    DrawScreen  = 4u, ///< Commit buffered writes to the display.
+    SetOptions  = 5u  ///< Set display options (font size, video standard, ...).
+};
+
+/** Feature flags returned by GetDeviceInfo (bitmask over a uint16_t). */
+enum class RunCamFeature : uint16_t {
+    SimulatePowerButton  = (1u <<  0), ///< Simulate the power / shutter button.
+    SimulateWiFiButton   = (1u <<  1), ///< Simulate the Wi-Fi pairing button.
+    ChangeMode           = (1u <<  2), ///< Cycle camera operating mode.
+    Simulate5KeyOSD      = (1u <<  3), ///< 5-key OSD remote emulation.
+    DeviceSettingsAccess = (1u <<  4), ///< Read / write device settings via OSD.
+    DisplayPort          = (1u <<  5), ///< Receive DisplayPort OSD overlay from FC.
+    StartRecording       = (1u <<  6), ///< Start video recording.
+    StopRecording        = (1u <<  7), ///< Stop video recording.
+    CmsMenu              = (1u <<  8), ///< CMS (Configuration Menu System) access.
+    FcAttitude           = (1u <<  9)  ///< Camera requests attitude from FC.
+};
+
+// =============================================================================
+// Data structures
+// =============================================================================
+
+/**
+ * @brief Attitude values exchanged with the camera for in-video OSD overlay.
+ *
+ * Roll and pitch are transported in decidegrees (tenths of a degree), matching
+ * the native resolution of Betaflight's attitude estimator.  Yaw is stored in
+ * decidegrees internally and converted to whole degrees on the wire.
+ */
+struct RunCamAttitude {
+    int16_t roll  = 0;  ///< Roll  angle, decidegrees, typical range [-1800,+1800].
+    int16_t pitch = 0;  ///< Pitch angle, decidegrees, typical range [ -900,+ 900].
+    int16_t yaw   = 0;  ///< Yaw   angle, decidegrees, typical range [    0,+3600].
+};
+
+/** Device information returned by the camera in response to GetDeviceInfo. */
 struct RunCamDeviceInfo {
-    uint8_t  protocolVersion; ///< Protocol version (0x00 = legacy RCSplit, 0x01 = v1.0)
-    uint16_t features;        ///< Bitmask of supported RunCamFeature flags
+    uint8_t  protocolVersion = 0u; ///< 0x00 = legacy RCSplit, 0x01 = v1.0.
+    uint16_t features        = 0u; ///< Bitmask of supported RunCamFeature flags.
 
-    /** @return true if the device supports the given feature flag. */
+    /** @return true if the device advertises the given feature flag. */
     bool hasFeature(RunCamFeature f) const {
-        return (features & static_cast<uint16_t>(f)) != 0;
+        return (features & static_cast<uint16_t>(f)) != 0u;
     }
 };
 
-// ---------------------------------------------------------------------------
-// Main library class
-// ---------------------------------------------------------------------------
+// =============================================================================
+// Main driver class
+// =============================================================================
 
 /**
- * @brief High-level driver for RunCam cameras using the RunCam Device Protocol.
+ * @brief Driver for RunCam cameras using the RunCam Device Protocol over UART.
  *
- * Implements the complete protocol including camera control, 5-key OSD navigation,
- * settings access, and attitude data exchange for in-video OSD overlay.
+ * The class is constructed without arguments — the underlying serial port,
+ * pin assignment, baud rate and timeout are provided to begin() at run time.
+ * All operations that can fail return a RunCamManagerStatus value, never a
+ * raw bool.
  *
- * ### Typical usage (ESP32-S3)
+ * ### Typical usage
  * @code
  *   #include <RunCamManager.h>
  *
- *   RunCamManager cam(Serial2, 16, 17); // RX=16, TX=17
+ *   RunCamManager camera;
  *
  *   void setup() {
  *       Serial.begin(115200);
- *       if (!cam.begin()) { Serial.println("Camera not found"); return; }
- *       cam.startRecording();
+ *
+ *       const RunCamManagerStatus s =
+ *           camera.begin(Serial2, 16, 17, 115200, 500);
+ *       if (s != RunCamManagerStatus::Ok) {
+ *           Serial.printf("RunCam begin failed: %s\n",
+ *                         RunCamManager::statusToString(s));
+ *           return;
+ *       }
+ *
+ *       (void) camera.startRecording();
  *   }
  *
  *   void loop() {
- *       // Keep the library's background handler running.
- *       // Required when using sendAttitude() / attitude OSD overlay.
- *       cam.update();
- *       // Update attitude values from your sensors:
- *       cam.setAttitude(rollDeg * 10, pitchDeg * 10, yawDeg * 10);
+ *       camera.update();   // service incoming attitude requests
  *   }
  * @endcode
- *
- * ### OSD navigation usage
- * @code
- *   cam.openOSDConnection();  // must be called before navigating
- *   cam.navigateDown();
- *   cam.confirmOSD();
- *   cam.closeOSDConnection(); // call when done
- * @endcode
  */
-class RunCamManager {
+class RunCamManager final {
 public:
-    // -----------------------------------------------------------------------
-    // Construction & initialisation
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Construction
+    // -------------------------------------------------------------------------
+
+    /** Construct an idle driver.  No hardware is touched until begin(). */
+    RunCamManager();
+
+    /** Default destructor.  Does not call end(); call it explicitly if needed. */
+    ~RunCamManager() = default;
+
+    // The driver owns a unique hardware resource; copying or moving is forbidden.
+    RunCamManager(const RunCamManager&)            = delete;
+    RunCamManager& operator=(const RunCamManager&) = delete;
+    RunCamManager(RunCamManager&&)                 = delete;
+    RunCamManager& operator=(RunCamManager&&)      = delete;
+
+    // -------------------------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------------------------
 
     /**
-     * @brief Construct a RunCamManager bound to a specific hardware serial port.
+     * @brief Open the UART, flush stale bytes and query the camera.
      *
-     * @param serial   Reference to the HardwareSerial port (e.g. Serial2).
-     * @param rxPin    GPIO pin number for UART RX (camera TX -> this pin).
-     * @param txPin    GPIO pin number for UART TX (this pin -> camera RX).
-     * @param baudRate UART baud rate (default 115200).
+     * Calling begin() twice without an intervening end() returns
+     * RunCamManagerStatus::AlreadyInitialized — the existing binding is kept.
+     *
+     * @param serial             HardwareSerial port (e.g. Serial1, Serial2).
+     * @param rxPin              GPIO pin number for UART RX  (camera TX -> us).
+     * @param txPin              GPIO pin number for UART TX  (us -> camera RX).
+     * @param baudRate           UART baud rate.  Default: 115200.
+     * @param responseTimeoutMs  Maximum wait for a response.  Default: 500 ms.
+     *
+     * @return Ok on success, or one of:
+     *         AlreadyInitialized, Timeout, CrcError, InvalidResponse.
      */
-    RunCamManager(HardwareSerial& serial,
-                  uint8_t rxPin,
-                  uint8_t txPin,
-                  uint32_t baudRate = RUNCAM_DEFAULT_BAUD);
+    RunCamManagerStatus begin(HardwareSerial& serial,
+                              uint8_t  rxPin,
+                              uint8_t  txPin,
+                              uint32_t baudRate          = RUNCAM_DEFAULT_BAUD,
+                              uint32_t responseTimeoutMs = RUNCAM_DEFAULT_TIMEOUT_MS);
 
     /**
-     * @brief Initialise the serial port and query the camera.
+     * @brief Close the UART and reset internal state.
      *
-     * Opens the UART, flushes any stale bytes, and calls getDeviceInfo() to
-     * populate the internal feature cache. Call once from setup().
+     * After end() the object can be re-used by calling begin() again.
      *
-     * @return true  Camera responded successfully.
-     * @return false No camera detected or communication error.
+     * @return Ok always; NotInitialized if end() was called before begin().
      */
-    bool begin();
+    RunCamManagerStatus end();
 
-    // -----------------------------------------------------------------------
-    // Main loop update (attitude / background processing)
-    // -----------------------------------------------------------------------
+    /** @return true if begin() completed successfully and end() has not been called. */
+    bool isInitialized() const { return _initialized; }
 
     /**
-     * @brief Background handler — call this from your loop() function.
+     * @brief Service routine — call from loop() on every iteration.
      *
-     * Monitors incoming serial bytes for unsolicited camera requests.
-     * Currently handles:
-     *   - **FC Attitude request (0x50)**: When the camera asks for attitude data,
-     *     this method automatically responds with the last values set via
-     *     setAttitude() or setAttitudeDeg().
+     * Drains the receive buffer through an internal state machine and replies
+     * to camera-initiated requests:
+     *   - 0x50 (Request FC Attitude): the last attitude set via setAttitude()
+     *     is transmitted automatically.
      *
-     * This method is a no-op when no bytes are available so it is safe to call
-     * every iteration of loop() without a performance impact.
+     * Safe to call even when no bytes are available.  Never blocks.
      */
     void update();
 
-    // -----------------------------------------------------------------------
-    // Device information
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Device information (command 0x00)
+    // -------------------------------------------------------------------------
 
     /**
-     * @brief Request device information from the camera.
+     * @brief Query device information from the camera.
      *
-     * Sends command 0x00 and waits for the 5-byte response containing the
-     * protocol version and the feature bitmask.
-     *
-     * @param[out] info  Populated on success.
-     * @return true on success, false on timeout or CRC error.
+     * @param[out] outInfo  Populated only when Ok is returned.
+     * @return Ok, NotInitialized, Timeout, CrcError or InvalidResponse.
      */
-    bool getDeviceInfo(RunCamDeviceInfo& info);
+    RunCamManagerStatus getDeviceInfo(RunCamDeviceInfo& outInfo);
 
-    /**
-     * @brief Check whether the camera supports a particular feature.
-     *
-     * Uses the feature flags cached during begin(). Returns false if begin()
-     * has not been called successfully yet.
-     *
-     * @param feature  Feature to test.
-     * @return true if supported.
-     */
+    /** @return The device info cached by the last successful query. */
+    const RunCamDeviceInfo& getCachedDeviceInfo() const { return _deviceInfo; }
+
+    /** @return true if the cached info advertises the requested feature. */
     bool isFeatureSupported(RunCamFeature feature) const;
 
-    /**
-     * @brief Access the device info cached by the last successful begin() or
-     *        getDeviceInfo() call.
-     */
-    const RunCamDeviceInfo& getDeviceInfo() const { return _deviceInfo; }
-
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Camera control (command 0x01)
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     /**
-     * @brief Simulate a Wi-Fi button press.
+     * @brief Send a single Camera Control action (command 0x01, no response).
      *
-     * No response is expected from the camera for this command.
-     * @return true if the packet was sent.
+     * The camera does not reply, so success indicates the bytes were sent —
+     * not that the camera acted on them.  Use getCachedDeviceInfo() / the
+     * feature flags to find out which actions the device supports.
+     *
+     * @return Ok on transmit success, NotInitialized otherwise.
      */
-    bool simulateWiFiButton();
+    RunCamManagerStatus sendCameraControl(RunCamCameraAction action);
 
-    /**
-     * @brief Simulate a power button press.
-     * @return true if the packet was sent.
-     */
-    bool simulatePowerButton();
+    /** Simulate a Wi-Fi pairing button press. */
+    RunCamManagerStatus simulateWiFiButton();
+    /** Simulate a power / shutter button press. */
+    RunCamManagerStatus simulatePowerButton();
+    /** Cycle the camera to the next operating mode. */
+    RunCamManagerStatus changeMode();
+    /** Begin video recording. */
+    RunCamManagerStatus startRecording();
+    /** Stop video recording. */
+    RunCamManagerStatus stopRecording();
 
-    /**
-     * @brief Cycle the camera to the next operating mode (e.g. video -> photo).
-     * @return true if the packet was sent.
-     */
-    bool changeMode();
-
-    /**
-     * @brief Start video recording.
-     * @return true if the packet was sent.
-     */
-    bool startRecording();
-
-    /**
-     * @brief Stop video recording.
-     * @return true if the packet was sent.
-     */
-    bool stopRecording();
-
-    // -----------------------------------------------------------------------
-    // 5-Key OSD connection management (command 0x04)
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // 5-Key OSD connection (command 0x04)
+    // -------------------------------------------------------------------------
 
     /**
      * @brief Open the 5-key OSD cable connection.
      *
-     * Must be called before sending any OSD key press/release commands.
-     * The camera responds with a 3-byte acknowledgement packet.
+     * The camera answers with a 3-byte ACK packet.  Must succeed before any
+     * key-press / key-release command will be honoured.
      *
-     * @return true if the camera acknowledged the request with a valid CRC.
+     * @return Ok, NotInitialized, Timeout, CrcError or InvalidResponse.
      */
-    bool openOSDConnection();
+    RunCamManagerStatus openOSDConnection();
+
+    /** Close the 5-key OSD cable connection.  Same return semantics as open. */
+    RunCamManagerStatus closeOSDConnection();
+
+    /** @return true if the OSD connection is currently believed to be open. */
+    bool isOSDConnectionOpen() const { return _osdConnectionOpen; }
+
+    // -------------------------------------------------------------------------
+    // 5-Key OSD key actuation (commands 0x02 / 0x03)
+    // -------------------------------------------------------------------------
 
     /**
-     * @brief Close the 5-key OSD cable connection.
+     * @brief Send a 5-key OSD button press.
      *
-     * Call when finished with OSD navigation to release the connection.
-     * The camera responds with a 3-byte acknowledgement packet.
+     * Requires an open OSD connection (see openOSDConnection()).
      *
-     * @return true if the camera acknowledged the request with a valid CRC.
+     * @param key  Key to press; must not be RunCamOSDKey::None.
+     * @return Ok, NotInitialized, ConnectionClosed, InvalidParameter,
+     *         Timeout, CrcError or InvalidResponse.
      */
-    bool closeOSDConnection();
-
-    // -----------------------------------------------------------------------
-    // 5-Key OSD navigation (commands 0x02 / 0x03)
-    // -----------------------------------------------------------------------
+    RunCamManagerStatus pressOSDKey(RunCamOSDKey key);
 
     /**
-     * @brief Simulate a 5-key OSD remote button press.
+     * @brief Release whatever 5-key button is currently pressed.
      *
-     * The camera sends a 2-byte ACK ([0xCC][CRC8]) if the connection is open.
+     * The release command carries no key payload.
      *
-     * @param key  Key to press (must not be RunCamOSDKey::None).
-     * @return true if the camera acknowledged the press.
+     * @return Ok, NotInitialized, ConnectionClosed, Timeout, CrcError or
+     *         InvalidResponse.
      */
-    bool pressOSDKey(RunCamOSDKey key);
+    RunCamManagerStatus releaseOSDKey();
 
     /**
-     * @brief Simulate a 5-key OSD remote button release.
-     *
-     * The release command carries no key payload; the camera releases whatever
-     * key is currently pressed. The camera sends a 2-byte ACK on success.
-     *
-     * @return true if the camera acknowledged the release.
-     */
-    bool releaseOSDKey();
-
-    /**
-     * @brief Press and release an OSD key, optionally holding for a duration.
-     *
-     * Opens the key press, delays holdMs milliseconds, then sends release.
+     * @brief Press a key, hold it for @p holdMs, then release it.
      *
      * @param key     Key to actuate (must not be RunCamOSDKey::None).
-     * @param holdMs  Hold duration in milliseconds (default 100 ms).
-     * @return true if both press and release were acknowledged.
+     * @param holdMs  Hold time in milliseconds.  Default: 100 ms.
      */
-    bool pressAndReleaseOSDKey(RunCamOSDKey key, uint32_t holdMs = 100);
+    RunCamManagerStatus pressAndReleaseOSDKey(RunCamOSDKey key, uint32_t holdMs = 100u);
 
-    /** @brief Navigate OSD menu up. Requires an open OSD connection. */
-    bool navigateUp()    { return pressAndReleaseOSDKey(RunCamOSDKey::Up); }
+    /** Navigate up.    Requires an open OSD connection. */
+    RunCamManagerStatus navigateUp();
+    /** Navigate down.  Requires an open OSD connection. */
+    RunCamManagerStatus navigateDown();
+    /** Navigate left.  Requires an open OSD connection. */
+    RunCamManagerStatus navigateLeft();
+    /** Navigate right. Requires an open OSD connection. */
+    RunCamManagerStatus navigateRight();
+    /** Confirm the current menu selection. Requires an open OSD connection. */
+    RunCamManagerStatus confirmOSD();
 
-    /** @brief Navigate OSD menu down. Requires an open OSD connection. */
-    bool navigateDown()  { return pressAndReleaseOSDKey(RunCamOSDKey::Down); }
-
-    /** @brief Navigate OSD menu left / back. Requires an open OSD connection. */
-    bool navigateLeft()  { return pressAndReleaseOSDKey(RunCamOSDKey::Left); }
-
-    /** @brief Navigate OSD menu right / forward. Requires an open OSD connection. */
-    bool navigateRight() { return pressAndReleaseOSDKey(RunCamOSDKey::Right); }
-
-    /** @brief Confirm / enter the currently highlighted OSD menu item. */
-    bool confirmOSD()    { return pressAndReleaseOSDKey(RunCamOSDKey::Center); }
-
-    // -----------------------------------------------------------------------
-    // Attitude data for OSD overlay (command 0x50)
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // FC attitude (command 0x50)
+    // -------------------------------------------------------------------------
 
     /**
-     * @brief Set the current attitude using raw decidegree values.
+     * @brief Cache attitude values for transmission to the camera.
      *
-     * These values are cached and sent to the camera automatically by update()
-     * whenever the camera sends an attitude request (0x50), so they are also
-     * sent proactively via sendAttitude().
+     * The values are pushed automatically by update() in response to a
+     * camera attitude request, or proactively by sendAttitude().
      *
-     * @param rollDecideg   Roll  in decidegrees (x10 of degrees). Range: -1800 to +1800.
-     * @param pitchDecideg  Pitch in decidegrees (x10 of degrees). Range: -900 to +900.
-     * @param yawDecideg    Yaw   in decidegrees (x10 of degrees). Range: 0 to +3600.
+     * @param rollDecideg   Roll  in decidegrees.
+     * @param pitchDecideg  Pitch in decidegrees.
+     * @param yawDecideg    Yaw   in decidegrees.
      */
     void setAttitude(int16_t rollDecideg, int16_t pitchDecideg, int16_t yawDecideg);
 
-    /**
-     * @brief Set the current attitude using floating-point degree values.
-     *
-     * Convenience wrapper that converts degrees to decidegrees internally.
-     *
-     * @param rollDeg   Roll  in degrees (e.g. −45.0 … +45.0).
-     * @param pitchDeg  Pitch in degrees (e.g. −90.0 … +90.0).
-     * @param yawDeg    Yaw   in degrees (e.g. 0.0 … 360.0).
-     */
+    /** Convenience overload accepting floating-point degree values. */
     void setAttitudeDeg(float rollDeg, float pitchDeg, float yawDeg);
 
-    /**
-     * @brief Send the current attitude data to the camera immediately.
-     *
-     * Transmits a command 0x50 packet containing roll, pitch and yaw values
-     * (last set via setAttitude() or setAttitudeDeg()). This can be called
-     * proactively each loop() iteration; update() also calls it automatically
-     * when the camera requests attitude data.
-     *
-     * Packet layout:
-     *   [0xCC][0x50][roll_L][roll_H][pitch_L][pitch_H][yaw_L][yaw_H][CRC8]
-     *
-     * Roll and pitch are sent in decidegrees; yaw is sent in whole degrees.
-     */
-    void sendAttitude();
-
-    /**
-     * @brief Return the currently cached attitude values.
-     */
+    /** @return The currently cached attitude values. */
     const RunCamAttitude& getAttitude() const { return _attitude; }
 
-    // -----------------------------------------------------------------------
-    // OSD text lines for video overlay (MSP DisplayPort, command 182)
-    // -----------------------------------------------------------------------
+    /**
+     * @brief Transmit the cached attitude values to the camera.
+     *
+     * Packet layout:
+     *   [0xCC][0x50][roll_L][roll_H][pitch_L][pitch_H][yaw_L][yaw_H][CRC]
+     *
+     * Roll / pitch are sent in decidegrees; yaw is sent in whole degrees as
+     * a signed 16-bit value (matching the Betaflight implementation).
+     *
+     * @return Ok on transmit, NotInitialized otherwise.
+     */
+    RunCamManagerStatus sendAttitude();
+
+    // -------------------------------------------------------------------------
+    // MSP DisplayPort text overlay (MSP command 182)
+    // -------------------------------------------------------------------------
 
     /**
-     * @brief Set the text for a numbered OSD line.
+     * @brief Store the text for a numbered OSD line.
      *
-     * Lines are displayed in the **top-right corner** of the video frame, one
-     * per row, right-aligned so the last character touches the right edge of
-     * the OSD grid.  Call sendOSDLines() to push pending changes to the camera.
+     * Lines are rendered right-aligned in the top portion of the OSD grid.
+     * The text is copied; the caller may free or reuse @p text immediately.
      *
-     * @param lineIndex  Line number, 0–(RUNCAM_OSD_MAX_LINES–1).
-     *                   Line 0 is the topmost row.
-     * @param text       NUL-terminated string (max RUNCAM_OSD_MAX_LINE_LEN
-     *                   chars; longer strings are silently truncated).
+     * Call sendOSDLines() (or the convenience wrappers) to push the
+     * accumulated state to the camera.
+     *
+     * @param lineIndex  Row index [0, RUNCAM_OSD_MAX_LINES).
+     * @param text       NUL-terminated string; longer than
+     *                   RUNCAM_OSD_MAX_LINE_LEN characters is silently
+     *                   truncated.
+     * @return Ok or InvalidParameter.
      */
-    void setOSDLine(uint8_t lineIndex, const char* text);
+    RunCamManagerStatus setOSDLine(uint8_t lineIndex, const char* text);
+
+    /** Clear a single OSD line.  Returns InvalidParameter when out of range. */
+    RunCamManagerStatus clearOSDLine(uint8_t lineIndex);
+
+    /** Clear all OSD lines.  Always returns Ok. */
+    RunCamManagerStatus clearAllOSDLines();
 
     /**
-     * @brief Clear a single OSD line.
+     * @brief Push the active OSD line buffer to the camera.
      *
-     * The line will not be drawn on the next sendOSDLines() call.
+     * Transmits, in order:
+     *   1. CLEAR_SCREEN
+     *   2. WRITE_STRING for each active, non-empty line
+     *   3. DRAW_SCREEN
      *
-     * @param lineIndex  Line number to clear, 0–(RUNCAM_OSD_MAX_LINES–1).
+     * The camera must support RunCamFeature::DisplayPort for the overlay to
+     * be visible; calling this method without DisplayPort support is
+     * harmless but invisible.
+     *
+     * @return Ok or NotInitialized.
      */
-    void clearOSDLine(uint8_t lineIndex);
+    RunCamManagerStatus sendOSDLines();
 
-    /**
-     * @brief Clear all OSD text lines.
-     *
-     * After this call, sendOSDLines() will issue a screen-clear with no text.
-     */
-    void clearAllOSDLines();
+    /** Send a DisplayPort keep-alive heartbeat (sub-command 0). */
+    RunCamManagerStatus sendDisplayPortHeartbeat();
 
-    /**
-     * @brief Push all active OSD text lines to the camera via MSP DisplayPort.
-     *
-     * Sends the following MSP DisplayPort sequence:
-     *   1. CLEAR_SCREEN  — erases the previous overlay
-     *   2. WRITE_STRING  — one packet per active line, right-aligned
-     *   3. DRAW_SCREEN   — commits the buffered characters to the display
-     *
-     * Call this whenever lines change, or periodically (e.g. every 200 ms) to
-     * keep the overlay visible.
-     *
-     * The camera must support the DisplayPort feature
-     * (RunCamFeature::DisplayPort) for the overlay to appear on video.
-     * Calling this method on a camera that does not support DisplayPort is safe
-     * but has no visible effect.
-     *
-     * @return true  if at least one line was written; false if all lines are
-     *               empty (a CLEAR_SCREEN + DRAW_SCREEN is still sent).
-     */
-    bool sendOSDLines();
+    /** Send a DisplayPort release (sub-command 1) — hand the OSD back. */
+    RunCamManagerStatus releaseDisplayPort();
 
-    // -----------------------------------------------------------------------
+    /** Send a stand-alone CLEAR_SCREEN + DRAW_SCREEN pair. */
+    RunCamManagerStatus clearDisplayPortScreen();
+
+    /** Send a DisplayPort SET_OPTIONS (sub-command 5) with a 2-byte payload. */
+    RunCamManagerStatus setDisplayPortOptions(uint8_t fontIndex, uint8_t videoMode);
+
+    // -------------------------------------------------------------------------
     // Configuration
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
-    /**
-     * @brief Set the timeout used when waiting for camera responses.
-     *
-     * @param timeoutMs  Timeout in milliseconds (default 500 ms).
-     */
+    /** Set the response timeout used for all command/response exchanges. */
     void setResponseTimeout(uint32_t timeoutMs) { _timeoutMs = timeoutMs; }
 
-    /**
-     * @brief Return the currently configured response timeout in milliseconds.
-     */
+    /** @return The currently configured response timeout in milliseconds. */
     uint32_t getResponseTimeout() const { return _timeoutMs; }
 
-    // -----------------------------------------------------------------------
-    // Low-level protocol utilities
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Static utilities
+    // -------------------------------------------------------------------------
 
     /**
-     * @brief Calculate the CRC-8/DVB-S2 checksum of a byte buffer.
+     * @brief Compute the CRC-8/DVB-S2 checksum (polynomial 0xD5, init 0x00).
      *
-     * Uses polynomial 0xD5 with initial value 0x00 — the same algorithm used
-     * by Betaflight and iNav for the RunCam Device Protocol.
-     *
-     * @param data  Pointer to input bytes.
-     * @param len   Number of bytes to process.
-     * @return 8-bit CRC value.
+     * Matches the Betaflight / iNav implementation of the RunCam protocol.
      */
     static uint8_t calculateCRC8(const uint8_t* data, uint8_t len);
 
+    /** @return A static, NUL-terminated, English description of @p status. */
+    static const char* statusToString(RunCamManagerStatus status);
+
 private:
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Internal helpers
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
-    /** Build and transmit: [0xCC][cmdId][data…][CRC8]. */
-    void sendPacket(RunCamCommand cmdId,
-                    const uint8_t* data = nullptr,
-                    uint8_t dataLen = 0);
+    RunCamManagerStatus sendPacket(RunCamCommand cmdId,
+                                   const uint8_t* data = nullptr,
+                                   uint8_t dataLen     = 0u);
 
-    /**
-     * @brief Block until exactly expectedLen bytes are available in the RX buffer.
-     *
-     * @param[out] buffer      Destination buffer (≥ expectedLen bytes).
-     * @param      expectedLen Number of bytes to read.
-     * @return true on success, false on timeout.
-     */
-    bool receiveBytes(uint8_t* buffer, uint8_t expectedLen);
+    RunCamManagerStatus receiveBytes(uint8_t* buffer, uint8_t expectedLen);
 
-    /**
-     * @brief Verify the trailing CRC byte of a packet.
-     *
-     * Computes CRC-8/DVB-S2 over buf[0 … len-2] and compares with buf[len-1].
-     *
-     * @param buf  Packet buffer (header + payload + CRC byte).
-     * @param len  Total packet length including CRC.
-     * @return true if the CRC is correct.
-     */
     static bool validateCRC(const uint8_t* buf, uint8_t len);
 
-    /** Dispatch a CameraControl command (0x01) with the given action byte. */
-    bool sendCameraControl(RunCamCameraAction action);
+    RunCamManagerStatus sendOSD5KeyConnection(RunCamOSD5KeyAction action);
 
-    /** Open or close the 5-key OSD connection and wait for ACK. */
-    bool sendOSD5KeyConnection(RunCamOSD5KeyAction action);
+    RunCamManagerStatus sendMSPPacket(uint8_t cmd,
+                                      const uint8_t* payload,
+                                      uint8_t payloadLen);
 
-    /**
-     * @brief Transmit a raw MSP v1 packet (used for DisplayPort commands).
-     *
-     * Frame layout: '$' 'M' '<' [payloadLen] [cmd] [payload…] [XOR checksum]
-     * The XOR checksum covers payloadLen, cmd, and every payload byte.
-     *
-     * @param cmd        MSP command byte (e.g. 182 for DISPLAYPORT).
-     * @param payload    Payload bytes (may be nullptr if payloadLen == 0).
-     * @param payloadLen Number of payload bytes.
-     */
-    void sendMSPPacket(uint8_t cmd, const uint8_t* payload, uint8_t payloadLen);
+    RunCamManagerStatus sendDisplayPortSub(RunCamDisplayPortSub sub,
+                                           const uint8_t* extra = nullptr,
+                                           uint8_t extraLen     = 0u);
 
-    // -----------------------------------------------------------------------
-    // Private state for update() / attitude request handler
-    // -----------------------------------------------------------------------
+    void flushReceiveBuffer();
 
-    /** Receive-state machine states used by update(). */
+    void resetReceiveState();
+
+    // -------------------------------------------------------------------------
+    // Internal receive state machine (used by update())
+    // -------------------------------------------------------------------------
+
     enum class RxState : uint8_t {
-        WaitingHeader  = 0,
-        WaitingCommand = 1,
-        WaitingCRC     = 2,
+        WaitingHeader  = 0u,
+        WaitingCommand = 1u,
+        WaitingPayload = 2u,
+        WaitingCRC     = 3u
     };
 
-    // -----------------------------------------------------------------------
-    // Member variables
-    // -----------------------------------------------------------------------
+    static constexpr uint8_t  RX_BUF_CAPACITY = 16u;
 
-    HardwareSerial&  _serial;       ///< Bound hardware serial port
-    uint8_t          _rxPin;        ///< GPIO RX pin
-    uint8_t          _txPin;        ///< GPIO TX pin
-    uint32_t         _baudRate;     ///< UART baud rate
-    uint32_t         _timeoutMs;    ///< Response timeout in ms
-    bool             _initialized;  ///< true after a successful begin()
-    RunCamDeviceInfo _deviceInfo;   ///< Cached result of last getDeviceInfo()
-    RunCamAttitude   _attitude;     ///< Attitude data sent to the camera
-    RxState          _rxState;      ///< State machine state for update()
-    uint8_t          _rxBuf[3];     ///< Accumulation buffer for update() parser
-    uint8_t          _rxBufLen;     ///< Number of bytes collected so far
+    // -------------------------------------------------------------------------
+    // Member state
+    // -------------------------------------------------------------------------
 
-    // OSD text overlay state
-    char  _osdLines[RUNCAM_OSD_MAX_LINES][RUNCAM_OSD_MAX_LINE_LEN + 1]; ///< Text per line
-    bool  _osdLineActive[RUNCAM_OSD_MAX_LINES];                          ///< Set = line has content
+    HardwareSerial*  _serial            = nullptr;  ///< Bound serial port (nullptr until begin()).
+    uint8_t          _rxPin             = 0u;
+    uint8_t          _txPin             = 0u;
+    uint32_t         _baudRate          = RUNCAM_DEFAULT_BAUD;
+    uint32_t         _timeoutMs         = RUNCAM_DEFAULT_TIMEOUT_MS;
+
+    bool             _initialized       = false;
+    bool             _osdConnectionOpen = false;
+
+    RunCamDeviceInfo _deviceInfo        = {};
+    RunCamAttitude   _attitude          = {};
+
+    // Receive state machine for update()
+    RxState          _rxState           = RxState::WaitingHeader;
+    uint8_t          _rxBuf[RX_BUF_CAPACITY] = {};
+    uint8_t          _rxBufLen          = 0u;
+    uint8_t          _rxPayloadRemain   = 0u;
+
+    // OSD text buffer (one row per RUNCAM_OSD_MAX_LINES).
+    char             _osdLines[RUNCAM_OSD_MAX_LINES][RUNCAM_OSD_MAX_LINE_LEN + 1u] = {};
+    bool             _osdLineActive[RUNCAM_OSD_MAX_LINES] = {};
 };

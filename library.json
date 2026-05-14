@@ -1,8 +1,8 @@
 {
   "name": "RunCamManagerLib",
-  "version": "1.2.0",
-  "description": "Full UART interface library for RunCam cameras on ESP32-S3 (Arduino / PlatformIO), implementing the complete RunCam Device Protocol (CRC-8/DVB-S2, all commands) plus MSP DisplayPort OSD text overlay.",
-  "keywords": ["runcam", "fpv", "uart", "camera", "osd", "attitude", "esp32", "esp32-s3"],
+  "version": "2.0.0",
+  "description": "Professional UART driver for RunCam cameras on ESP32 / ESP32-S3 (Arduino / PlatformIO). Implements the complete RunCam Device Protocol with CRC-8/DVB-S2 (Get Device Info, Camera Control, 5-key OSD with connection management, FC attitude 0x50) plus the full MSP DisplayPort text overlay (heartbeat, release, clear, write-string, draw, options). Hardware parameters are configured via begin(); every fallible call returns a RunCamManagerStatus value. Deterministic, fault-tolerant, JSF-AV-C++ style.",
+  "keywords": ["runcam", "fpv", "uart", "camera", "osd", "attitude", "displayport", "msp", "esp32", "esp32-s3"],
   "repository": {
     "type": "git",
     "url": "https://github.com/AttilaRibar/RunCamManagerLib"
@@ -40,6 +40,11 @@
       "name": "FullFeatureDemo",
       "base": "examples/FullFeatureDemo",
       "files": ["FullFeatureDemo.ino"]
+    },
+    {
+      "name": "StatusHandling",
+      "base": "examples/StatusHandling",
+      "files": ["StatusHandling.ino"]
     }
   ]
 }
